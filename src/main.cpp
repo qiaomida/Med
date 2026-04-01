@@ -31,7 +31,7 @@ HX711 scale3;
 HX711 scale4;
 
 
-char auth[] = "5e6143510577"; //blinker的密钥
+char auth[] = "6820a0a174cb"; //blinker的密钥
 char ssid[] = "Xiaomi 13";         // wifi名称
 char pswd[] = "qiaomi667";     // wifi密码
 // 新建组件对象
@@ -41,6 +41,7 @@ BlinkerButton Button_up("btn-up");
 BlinkerButton Button_down("btn-down");
 BlinkerButton Button_left("btn-left");
 BlinkerButton Button_right("btn-right");
+BlinkerSlider Slider1("ran-abc"); // 新增：用于调整吃药间隔的滑动条
 
 
 
@@ -61,50 +62,56 @@ static uint64_t g_lastTriggeredEpochSec = 0;
 // 4) interval 0            禁用间隔模式
 void handleSerialDebug()
 {
-  if (!Serial.available())
-    return;
+  static String serialBuffer = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      // 收到换行，处理缓冲区中的命令
+      String line = serialBuffer;
+      line.trim();
+      serialBuffer = ""; // 清空缓冲区
+      if (line.length() == 0) return;
 
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0)
-    return;
+      int sp = line.indexOf(' ');
+      String cmd = (sp < 0) ? line : line.substring(0, sp);
+      String arg = (sp < 0) ? String("") : line.substring(sp + 1);
+      cmd.toLowerCase();
 
-  int sp = line.indexOf(' ');
-  String cmd = (sp < 0) ? line : line.substring(0, sp);
-  String arg = (sp < 0) ? String("") : line.substring(sp + 1);
-  cmd.toLowerCase();
+      if (cmd == "offset") {
+        int32_t v = (int32_t)arg.toInt();
+        setDebugTimeOffsetSec(v);
+        Serial.printf("[debug] time offset sec = %ld\r\n", (long)v);
+        return;
+      }
 
-  if (cmd == "offset") {
-    int32_t v = (int32_t)arg.toInt();
-    setDebugTimeOffsetSec(v);
-    Serial.printf("[debug] time offset sec = %ld\r\n", (long)v);
-    return;
-  }
+      if (cmd == "interval") {
+        int32_t hours = (int32_t)arg.toInt();
+        if (hours <= 0) g_doseIntervalSec = 0;
+        else g_doseIntervalSec = (uint32_t)hours * 3600UL;
+        g_nextDoseEpochSec = 0;
+        g_lastTriggeredEpochSec = 0;
+        Serial.printf("[debug] interval sec = %lu\r\n", (unsigned long)g_doseIntervalSec);
+        return;
+      }
 
-  if (cmd == "interval") {
-    int32_t hours = (int32_t)arg.toInt();
-    if (hours <= 0) g_doseIntervalSec = 0;
-    else g_doseIntervalSec = (uint32_t)hours * 3600UL;
-    g_nextDoseEpochSec = 0;
-    g_lastTriggeredEpochSec = 0;
-    Serial.printf("[debug] interval sec = %lu\r\n", (unsigned long)g_doseIntervalSec);
-    return;
-  }
+      if (cmd == "interval_sec") {
+        int32_t sec = (int32_t)arg.toInt();
+        if (sec <= 0) g_doseIntervalSec = 0;
+        else g_doseIntervalSec = (uint32_t)sec;
+        g_nextDoseEpochSec = 0;
+        g_lastTriggeredEpochSec = 0;
+        Serial.printf("[debug] interval sec = %lu\r\n", (unsigned long)g_doseIntervalSec);
+        return;
+      }
 
-  if (cmd == "interval_sec") {
-    int32_t sec = (int32_t)arg.toInt();
-    if (sec <= 0) g_doseIntervalSec = 0;
-    else g_doseIntervalSec = (uint32_t)sec;
-    g_nextDoseEpochSec = 0;
-    g_lastTriggeredEpochSec = 0;
-    Serial.printf("[debug] interval sec = %lu\r\n", (unsigned long)g_doseIntervalSec);
-    return;
-  }
-
-  if (cmd == "sync_ntp") {
-    updateNtpTime();
-    Serial.println("[debug] ntp sync requested");
-    return;
+      if (cmd == "sync_ntp") {
+        updateNtpTime();
+        Serial.println("[debug] ntp sync requested");
+        return;
+      }
+    } else if (c != '\r') {
+      serialBuffer += c;
+    }
   }
 }
 
@@ -334,6 +341,25 @@ void button_right_callback(const String & state)
     }
 }
 
+// 滑动条回调函数，用于设置吃药间隔（单位：小时）
+void slider1_callback(int32_t value)
+{
+    BLINKER_LOG("get slider value: ", value);
+    if (value <= 0) {
+        g_doseIntervalSec = 0; // 禁用间隔模式
+        Serial.println("[Blinker] Interval mode disabled (set to fixed times).");
+    } else {
+        g_doseIntervalSec = (uint32_t)value * 60UL; // 将分钟转换为秒
+        armSet = true;        // 强制开启闹钟，使间隔模式生效
+        Day = 1;              // 从第一天开始重新计数
+        ArmTime::initarmCiShu(); // 重置服药次数
+        g_nextDoseEpochSec = 0; // 重置下次触发时间，使其在 loop 中重新计算
+        g_lastTriggeredEpochSec = 0;
+        Serial.printf("[Blinker] Dose interval set to %d minutes (%lu seconds).\r\n", value, (unsigned long)g_doseIntervalSec);
+        Serial.println("[Blinker] Alarm ENABLED, Day RESET to 1.");
+    }
+}
+
 
 
 
@@ -348,8 +374,8 @@ void dataRead(const String & data)
 void blinker_init()
 {
     
-  BLINKER_DEBUG.stream(Serial);
-  BLINKER_DEBUG.debugAll();
+  // BLINKER_DEBUG.stream(Serial);
+  // BLINKER_DEBUG.debugAll(); // 注释掉，减少串口输出压力，防止缓冲区溢出导致重启
     
   // 初始化有LED的IO
   pinMode(LED_BUILTIN, OUTPUT);
@@ -363,6 +389,7 @@ void blinker_init()
   Button_down.attach(button_down_callback);
   Button_left.attach(button_left_callback);
   Button_right.attach(button_right_callback);
+  Slider1.attach(slider1_callback); // 绑定滑动条回调
 }
 
 
@@ -546,9 +573,9 @@ void setup()
   scale3.tare();  // 重置秤，忽略已有的重量，仅测量后加上去的重量
   scale4.tare();  // 重置秤，忽略已有的重量，仅测量后加上去的重量
 
-  xTaskCreatePinnedToCore(xTaskOne, "TaskOne", 4096, NULL, 1, NULL, 0);//TaskOne在 0核心
-  xTaskCreatePinnedToCore(xTaskTwo, "TaskTwo", 4096, NULL, 1, NULL, 1);//TaskOne在 1核心
-  xTaskCreatePinnedToCore(xTaskThree, "TaskThree", 4096, NULL, 3, NULL, 0);//TaskOne在 0核心
+  xTaskCreatePinnedToCore(xTaskOne, "TaskOne", 8192, NULL, 1, NULL, 0);//Blinker任务：核心0，增加栈空间防止溢出
+  xTaskCreatePinnedToCore(xTaskTwo, "TaskTwo", 4096, NULL, 1, NULL, 1);//按键任务：核心1
+  xTaskCreatePinnedToCore(xTaskThree, "TaskThree", 4096, NULL, 1, NULL, 0);//显示任务：核心0，降低优先级减少冲突
 
 }
 void loop() 
@@ -582,17 +609,19 @@ void loop()
     if (g_doseIntervalSec > 0) {
       uint64_t nowEpoch = getNowEpochSec();
 
-      // nowEpoch 尚未可用（未完成 NTP 校时）时暂不触发，等校时后再计算 next
-      if (nowEpoch > 0 && g_nextDoseEpochSec == 0) {
-        uint64_t todayStart = nowEpoch - (nowEpoch % 86400ULL);
-        uint64_t best = 0;
-        for (int i = 0; i < 3; i++) {
-          uint64_t cand = todayStart + (uint64_t)armT[i].hour * 3600ULL + (uint64_t)armT[i].minute * 60ULL;
-          if (cand <= nowEpoch) cand += 86400ULL; // 若已错过则顺延到下一天
-          if (best == 0 || cand < best) best = cand;
+      // nowEpoch 尚未可用（未完成 NTP 校时）时暂不触发，打印提示
+      if (nowEpoch == 0) {
+        static uint32_t lastPrint = 0;
+        if (millis() - lastPrint > 5000) {
+          Serial.println("[debug] Waiting for NTP sync before interval alarm starts...");
+          lastPrint = millis();
         }
-        g_nextDoseEpochSec = best;
-        Serial.printf("[debug] next dose epoch = %llu\r\n", (unsigned long long)g_nextDoseEpochSec);
+      }
+
+      if (nowEpoch > 0 && g_nextDoseEpochSec == 0) {
+        // 间隔模式启用时，从当前时间开始计算下一次提醒
+        g_nextDoseEpochSec = nowEpoch + g_doseIntervalSec;
+        Serial.printf("[debug] Interval mode started. Next dose epoch = %llu\r\n", (unsigned long long)g_nextDoseEpochSec);
       }
 
       // 允许延迟触发：只要当前时间已到达（或超过）next，就触发一次并重排后续。
